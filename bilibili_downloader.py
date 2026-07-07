@@ -1,10 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Bilibili Download V1.0.0
-B站视频下载工具 - PySide6 GUI版本
-"""
-
 import sys
 import os
 import json
@@ -31,7 +24,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QSpinBox, QSpacerItem
 )
 from PySide6.QtCore import Qt, Signal, QThread, QSize, QObject, QTimer
-from PySide6.QtGui import QPixmap, QImage, QColor, QFont, QIcon
+from PySide6.QtGui import QPixmap, QImage, QColor, QFont, QIcon, QPainter
 
 try:
     import qrcode
@@ -222,7 +215,8 @@ class WBISigner:
         try:
             headers = {
                 "User-Agent": DEFAULT_UA,
-                "Referer": "https://www.bilibili.com"
+                "Referer": "https://www.bilibili.com",
+                "Origin": "https://www.bilibili.com"
             }
             if cookies_str:
                 headers["Cookie"] = cookies_str
@@ -231,8 +225,10 @@ class WBISigner:
                 headers=headers, timeout=10
             )
             data = resp.json()
-            if data.get("code") == 0:
-                wbi_img = data["data"]["wbi_img"]
+            # wbi_img 在 data 中即使未登录(code=-101)也会返回，
+            # 不能依赖 code==0，否则未登录时无法获取 WBI 密钥导致签名失败
+            wbi_img = data.get("data", {}).get("wbi_img")
+            if wbi_img:
                 img_url = wbi_img.get("img_url", "")
                 sub_url = wbi_img.get("sub_url", "")
                 self.img_key = img_url.split("/")[-1].split(".")[0]
@@ -257,6 +253,9 @@ class WBISigner:
         encoded_params = []
         for k in sorted(params.keys()):
             for v in params[k]:
+                # 过滤空值参数：空值参与 WBI 签名会导致服务端校验失败
+                if v == "":
+                    continue
                 encoded_k = quote(str(k), safe="")
                 encoded_v = quote(str(v), safe="")
                 encoded_params.append(f"{encoded_k}={encoded_v}")
@@ -264,8 +263,25 @@ class WBISigner:
         query_string = "&".join(encoded_params)
         md5_hash = hashlib.md5((query_string + self.mixin_key).encode()).hexdigest()
 
-        separator = "&" if parsed.query else "?"
-        return f"{url}{separator}w_rid={md5_hash}&wts={params['wts'][0]}"
+        # 重建完整URL，使用排序后的参数
+        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        return f"{base_url}?{query_string}&w_rid={md5_hash}"
+
+
+# ============================================================
+# 工具函数
+# ============================================================
+
+def format_count(n):
+    """格式化数字: 1902 -> '1902', 11200 -> '1.1万', 1112000 -> '111.2万'"""
+    if n >= 100000000:
+        val = round(n / 100000000, 1)
+        return f"{int(val)}亿" if val == int(val) else f"{val}亿"
+    elif n >= 10000:
+        val = round(n / 10000, 1)
+        return f"{int(val)}万" if val == int(val) else f"{val}万"
+    else:
+        return str(n)
 
 
 # ============================================================
@@ -417,6 +433,7 @@ class BilibiliClient:
         return {
             "User-Agent": self.config.get("user_agent", DEFAULT_UA),
             "Referer": referer,
+            "Origin": "https://www.bilibili.com",
             "Cookie": self._get_cookie_str()
         }
 
@@ -526,13 +543,23 @@ class BilibiliClient:
         return {}
 
     def get_play_url(self, bvid, cid, qn=80):
-        base_url = (
-            f"https://api.bilibili.com/x/player/wbi/playurl?"
-            f"cid={cid}&bvid={bvid}&qn={qn}&type=&otype=json"
-            f"&fnver=0&fnval=4048&fourk=1&gaia_source=&from_client=BROWSER"
-            f"&is_main_page=true&need_fragment=false&isGaiaAvoided=false"
-            f"&client_attr=0&session=&voice_balance=1&web_location=1315873"
-        )
+        # 参数对齐 pilipala 的 videoUrl 实现 (lib/http/video.dart)
+        # pilipala 仅传必要参数，避免空值参数干扰 WBI 签名校验
+        params = {
+            "cid": cid,
+            "bvid": bvid,
+            "qn": qn,
+            "fnval": 4048,
+            "fourk": 1,
+            "voice_balance": 1,
+            "gaia_source": "pre-load",
+            "web_location": 1550101,
+        }
+        # 未登录时添加 try_look=1，可免登录预览高清晰度（参考 pilipala）
+        if not self.login_cookies or not self.user_info:
+            params["try_look"] = 1
+        query = "&".join(f"{k}={v}" for k, v in params.items())
+        base_url = f"https://api.bilibili.com/x/player/wbi/playurl?{query}"
         signed_url = self.wbi_signer.sign(base_url, self._get_cookie_str())
         headers = self._get_headers(referer=f"https://www.bilibili.com/video/{bvid}")
         try:
@@ -595,6 +622,106 @@ class BilibiliClient:
             result.append({"qn": qn, "description": desc})
         return result
 
+    def get_uploader_videos(self, mid, page=1, page_size=30):
+        """获取UP主投稿视频列表 - x/space/wbi/arc/search"""
+        # 根据API文档: x/space/wbi/arc/search, params(Map)
+        base_url = (
+            f"https://api.bilibili.com/x/space/wbi/arc/search?"
+            f"mid={mid}&ps={page_size}&pn={page}&order=pubdate"
+        )
+
+        headers = self._get_headers(referer=f"https://space.bilibili.com/{mid}/video")
+        cookie_str = self._get_cookie_str()
+
+        # 最多重试2次（WBI签名可能因密钥刷新而失败）
+        for attempt in range(2):
+            try:
+                # 每次重试都重新签名（刷新WBI密钥）
+                if attempt > 0:
+                    self.wbi_signer.last_refresh = 0  # 强制刷新密钥
+                signed_url = self.wbi_signer.sign(base_url, cookie_str)
+
+                resp = self.session.get(signed_url, headers=headers, timeout=15)
+                data = resp.json()
+
+                if data.get("code") == 0:
+                    result = data.get("data", {})
+                    return result
+                elif data.get("code") == -401 or "w_rid" in data.get("message", ""):
+                    # WBI签名错误，重试
+                    continue
+                else:
+                    return {}
+            except Exception:
+                continue
+
+        return {}
+
+    def get_uploader_info(self, mid):
+        """获取UP主信息 - 尝试多个API，统一返回格式"""
+        result = {"name": "", "face": "", "sign": "", "video": 0, "follower": 0, "mid": mid}
+
+        # 方法1: x/web-interface/card - 包含完整信息（投稿数、粉丝数），不需要WBI签名
+        url_card = f"https://api.bilibili.com/x/web-interface/card?mid={mid}&photo=true"
+        try:
+            resp = self.session.get(url_card, headers=self._get_headers(referer=f"https://space.bilibili.com/{mid}"), timeout=10)
+            data = resp.json()
+            if data.get("code") == 0 and data.get("data"):
+                d = data["data"]
+                card = d.get("card", {})
+                result["name"] = card.get("name", "")
+                result["face"] = card.get("face", "")
+                result["sign"] = card.get("sign", "") or card.get("description", "")
+                # archive_count 在 data 顶层，不在 card 里
+                result["video"] = d.get("archive_count", 0) or card.get("archive_count", 0) or 0
+                # follower 在 data 顶层
+                result["follower"] = d.get("follower", 0) or card.get("fans", 0) or 0
+                if result["name"]:
+                    return result
+        except Exception:
+            pass
+
+        # 方法2: x/space/wbi/acc/info (WBI签名) - 只有基本信息
+        url1_base = f"https://api.bilibili.com/x/space/wbi/acc/info?mid={mid}"
+        signed_url = self.wbi_signer.sign(url1_base, self._get_cookie_str())
+        try:
+            resp = self.session.get(signed_url, headers=self._get_headers(referer=f"https://space.bilibili.com/{mid}"), timeout=10)
+            data = resp.json()
+            if data.get("code") == 0 and data.get("data"):
+                d = data["data"]
+                if not result["name"]:
+                    result["name"] = d.get("name", "")
+                if not result["face"]:
+                    result["face"] = d.get("face", "")
+                if not result["sign"]:
+                    result["sign"] = d.get("sign", "")
+        except Exception:
+            pass
+
+        # 方法3: x/relation/stat - 补充粉丝数
+        url_stat = f"https://api.bilibili.com/x/relation/stat?vmid={mid}"
+        try:
+            resp = self.session.get(url_stat, headers=self._get_headers(), timeout=10)
+            data = resp.json()
+            if data.get("code") == 0 and data.get("data"):
+                if not result["follower"]:
+                    result["follower"] = data["data"].get("follower", 0)
+        except Exception:
+            pass
+
+        # 方法4: x/space/upstat - 补充投稿数
+        if not result["video"]:
+            url_upstat = f"https://api.bilibili.com/x/space/upstat?mid={mid}"
+            try:
+                resp = self.session.get(url_upstat, headers=self._get_headers(referer=f"https://space.bilibili.com/{mid}"), timeout=10)
+                data = resp.json()
+                if data.get("code") == 0 and data.get("data"):
+                    result["video"] = data["data"].get("archive", 0)
+            except Exception:
+                pass
+
+        return result if result["name"] else {}
+
     def download_file(self, url, filepath, headers, progress_callback=None, cancel_flag=None):
         resp = self.session.get(url, headers=headers, stream=True, timeout=120)
         total_size = int(resp.headers.get("content-length", 0))
@@ -618,6 +745,90 @@ class BilibiliClient:
                         if progress_callback:
                             progress_callback(percent, downloaded, total_size, speed)
         return True
+
+    def get_collection_videos(self, bvid):
+        """通过BV号获取视频所属合集的所有视频"""
+        # 先获取视频详情，找到ugc_season
+        url = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
+        try:
+            resp = self.session.get(url, headers=self._get_headers(), timeout=10)
+            data = resp.json()
+            if data.get("code") != 0:
+                return None, "获取视频详情失败"
+
+            view = data["data"]
+            ugc_season = view.get("ugc_season")
+
+            if not ugc_season:
+                return None, "该视频不属于任何合集"
+
+            # 从ugc_season中提取视频列表
+            videos = []
+            for section in ugc_season.get("sections", []):
+                for ep in section.get("episodes", []):
+                    arc = ep.get("arc", {})
+                    stat = arc.get("stat", {})
+                    # 合集API中UP主信息在 arc.author 而非 arc.owner
+                    author = arc.get("author", {})
+                    videos.append({
+                        "bvid": ep.get("bvid", ""),
+                        "title": ep.get("title", ""),
+                        "cover": arc.get("pic", ""),
+                        "duration": ep.get("page", {}).get("duration", 0) or arc.get("duration", 0),
+                        "play": stat.get("view", 0),
+                        "owner_name": author.get("name", ""),
+                    })
+
+            info = {
+                "type": "collection",
+                "id": ugc_season.get("id"),
+                "title": ugc_season.get("title", ""),
+                "cover": ugc_season.get("cover", ""),
+                "count": ugc_season.get("ep_count", len(videos)),
+            }
+            return info, videos
+
+        except Exception as e:
+            return None, f"获取合集失败: {e}"
+
+    def get_favlist_videos(self, media_id, page=1, page_size=20):
+        """获取收藏夹视频列表"""
+        url = f"https://api.bilibili.com/x/v3/fav/resource/list?media_id={media_id}&pn={page}&ps={page_size}"
+        try:
+            resp = self.session.get(url, headers=self._get_headers(), timeout=10)
+            data = resp.json()
+            if data.get("code") != 0:
+                return None, None, data.get("message", "获取收藏夹失败")
+
+            d = data["data"]
+            videos = []
+            medias = d.get("medias") or []
+            for m in medias:
+                if not m:
+                    continue
+                videos.append({
+                    "bvid": m.get("bvid", "") or m.get("bv_id", ""),
+                    "title": m.get("title", ""),
+                    "cover": m.get("cover", ""),
+                    "duration": m.get("duration", 0),
+                    "play": m.get("cnt_info", {}).get("play", 0),
+                    "owner_name": m.get("upper", {}).get("name", ""),
+                })
+
+            info = {
+                "type": "favlist",
+                "id": d.get("info", {}).get("id"),
+                "title": d.get("info", {}).get("title", ""),
+                "cover": d.get("info", {}).get("cover", ""),
+                "count": d.get("info", {}).get("media_count", 0),
+                "mid": d.get("info", {}).get("mid", 0),
+                "upper_name": d.get("info", {}).get("upper", {}).get("name", ""),
+            }
+            total = d.get("info", {}).get("media_count", 0)
+            return info, videos, total
+
+        except Exception as e:
+            return None, None, f"获取收藏夹失败: {e}"
 
     def merge_video_audio(self, video_path, audio_path, output_path):
         try:
@@ -705,6 +916,135 @@ class QueryWorker(QThread):
 
         except Exception as e:
             self.error_signal.emit(f"查询失败: {str(e)}")
+
+
+class UploaderQueryWorker(QThread):
+    """UP主视频查询工作线程"""
+    log_signal = Signal(str, str)
+    info_signal = Signal(dict)
+    videos_signal = Signal(list, int, int)
+    error_signal = Signal(str)
+
+    def __init__(self, client, mid, page=1, page_size=20, skip_info=False):
+        super().__init__()
+        self.client = client
+        self.mid = mid
+        self.page = page
+        self.page_size = page_size
+        self.skip_info = skip_info
+
+    def run(self):
+        try:
+            # 步骤1: 查询UP主信息（翻页时跳过）
+            if not self.skip_info:
+                self.log_signal.emit(f"【步骤1】正在查询UP主信息: {self.mid}", "INFO")
+
+                uploader_info = self.client.get_uploader_info(self.mid)
+                if uploader_info:
+                    self.info_signal.emit(uploader_info)
+                else:
+                    fallback_info = {"name": f"UP主_{self.mid}", "face": "", "sign": "无法获取详细信息", "video": 0, "follower": 0}
+                    self.info_signal.emit(fallback_info)
+                    self.log_signal.emit("【步骤1结果】UP主信息获取失败，使用默认值继续...", "WARNING")
+
+            # 步骤2: 查询视频列表
+            self.log_signal.emit(f"【步骤2】正在获取视频列表 (第{self.page}页)...", "INFO")
+
+            data = self.client.get_uploader_videos(self.mid, self.page, self.page_size)
+
+            if not data:
+                self.error_signal.emit("【步骤2失败】获取视频列表返回空数据")
+                return
+
+            # 步骤3: 解析视频数据
+            videos = []
+            vlist = data.get("list", {}).get("vlist", [])
+
+            for i, v in enumerate(vlist):
+                video_item = {
+                    "bvid": v.get("bvid", ""),
+                    "title": v.get("title", ""),
+                    "cover": v.get("pic", ""),
+                    "duration": v.get("duration", 0),
+                    "play": v.get("play", 0),
+                    "created": v.get("created", 0),
+                    "description": v.get("description", "")
+                }
+                videos.append(video_item)
+
+            total = data.get("page", {}).get("count", 0)
+            page_count = (total + self.page_size - 1) // self.page_size if total > 0 else 1
+
+            self.log_signal.emit(f"【查询成功】获取到 {len(videos)} 个视频，共 {total} 个", "INFO")
+            self.videos_signal.emit(videos, total, page_count)
+
+        except Exception as e:
+            self.error_signal.emit(f"查询异常: {type(e).__name__}: {e}")
+
+
+class CollectionQueryWorker(QThread):
+    """合集/收藏夹查询工作线程"""
+    log_signal = Signal(str, str)
+    info_signal = Signal(dict)
+    videos_signal = Signal(list, int, int)
+    error_signal = Signal(str)
+
+    def __init__(self, client, query_type, query_input, page=1, page_size=20):
+        super().__init__()
+        self.client = client
+        self.query_type = query_type  # "collection" or "favlist"
+        self.query_input = query_input
+        self.page = page
+        self.page_size = page_size
+
+    def run(self):
+        try:
+            if self.query_type == "collection":
+                self._query_collection()
+            else:
+                self._query_favlist()
+        except Exception as e:
+            self.error_signal.emit(f"查询异常: {type(e).__name__}: {e}")
+
+    def _query_collection(self):
+        """查询合集"""
+        bvid = self.client.parse_bv(self.query_input)
+        if not bvid:
+            self.error_signal.emit("无法解析BV号，请检查输入")
+            return
+
+        self.log_signal.emit(f"正在查询视频所属合集: {bvid}", "INFO")
+        info, videos = self.client.get_collection_videos(bvid)
+
+        if info is None:
+            self.error_signal.emit(videos or "获取合集失败")
+            return
+
+        self.info_signal.emit(info)
+        total = len(videos)
+        page_count = 1
+        self.log_signal.emit(f"【查询成功】合集「{info.get('title', '')}」共 {total} 个视频", "INFO")
+        self.videos_signal.emit(videos, total, page_count)
+
+    def _query_favlist(self):
+        """查询收藏夹"""
+        try:
+            media_id = int(self.query_input)
+        except ValueError:
+            self.error_signal.emit("收藏夹ID必须是数字")
+            return
+
+        self.log_signal.emit(f"正在查询收藏夹: {media_id} (第{self.page}页)", "INFO")
+        info, videos, total = self.client.get_favlist_videos(media_id, self.page, self.page_size)
+
+        if info is None:
+            self.error_signal.emit(str(total) if total else "获取收藏夹失败")
+            return
+
+        self.info_signal.emit(info)
+        page_count = (total + self.page_size - 1) // self.page_size if total > 0 else 1
+        self.log_signal.emit(f"【查询成功】收藏夹「{info.get('title', '')}」共 {total} 个视频", "INFO")
+        self.videos_signal.emit(videos, total, page_count)
 
 
 class QuickAddWorker(QThread):
@@ -988,6 +1328,21 @@ class DownloadWorker(QThread):
     def run(self):
         try:
             self.status_signal.emit("正在获取下载链接...")
+            
+            # 如果没有cid，先获取视频分P信息
+            if not self.cid:
+                self.log_signal.emit(f"正在获取视频CID: {self.bvid}", "INFO")
+                pages = self.client.get_video_pages(self.bvid)
+                if not pages:
+                    self.finished_signal.emit(False, "获取视频分P信息失败")
+                    return
+                page_idx = self.page_index if self.page_index < len(pages) else 0
+                self.cid = pages[page_idx].get("cid")
+                if not self.cid:
+                    self.finished_signal.emit(False, "无法获取视频CID")
+                    return
+                self.log_signal.emit(f"获取到CID: {self.cid}", "INFO")
+
             self.log_signal.emit(f"正在获取播放链接: BV={self.bvid}, CID={self.cid}, QN={self.qn}", "INFO")
 
             play_data = self.client.get_play_url(self.bvid, self.cid, self.qn)
@@ -1185,6 +1540,58 @@ class CoverLoader(QThread):
             pass
 
 
+class BatchCoverLoader(QThread):
+    """批量加载视频封面"""
+    loaded = Signal(int, bytes)
+
+    def __init__(self, video_list):
+        super().__init__()
+        self.video_list = video_list
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        for i, v in enumerate(self.video_list):
+            if self._stop:
+                break
+            cover_url = v.get("cover", "")
+            if not cover_url:
+                continue
+            try:
+                if cover_url.startswith("//"):
+                    cover_url = "https:" + cover_url
+                resp = requests.get(cover_url, timeout=8)
+                if resp.status_code == 200 and not self._stop:
+                    self.loaded.emit(i, resp.content)
+            except Exception:
+                pass
+
+
+class FaceLoader(QThread):
+    """异步加载UP主头像"""
+    loaded = Signal(bytes)
+
+    def __init__(self, face_url):
+        super().__init__()
+        self.face_url = face_url
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            if self._stop:
+                return
+            resp = requests.get(self.face_url, timeout=10)
+            if not self._stop:
+                self.loaded.emit(resp.content)
+        except Exception:
+            pass
+
+
 # ============================================================
 # Main Window
 # ============================================================
@@ -1288,6 +1695,14 @@ class MainWindow(QMainWindow):
         self.query_page = self._create_query_page()
         self.tab_widget.addTab(self.query_page, "视频查询")
         
+        # UP主视频页面
+        self.uploader_page = self._create_uploader_page()
+        self.tab_widget.addTab(self.uploader_page, "UP主视频")
+
+        # 合集/收藏夹页面
+        self.collection_page = self._create_collection_page()
+        self.tab_widget.addTab(self.collection_page, "合集/收藏夹")
+
         # 下载页面
         self.download_page = self._create_download_page()
         self.tab_widget.addTab(self.download_page, "下载任务")
@@ -1310,7 +1725,7 @@ class MainWindow(QMainWindow):
         self.input_field.returnPressed.connect(self._on_query)
         btn_search = QPushButton("查询")
         btn_search.setFixedSize(70, 32)
-        btn_search.clicked.connect(self._on_query)
+        btn_search.clicked.connect(lambda: self._on_query())
         btn_download = QPushButton("添加到下载")
         btn_download.setFixedSize(100, 32)
         btn_download.clicked.connect(self._add_to_download)
@@ -1386,6 +1801,235 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 0)
 
         layout.addWidget(splitter, 1)
+        return page
+
+    def _create_uploader_page(self):
+        """创建UP主视频查询页面"""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+
+        # 顶部搜索栏
+        search_layout = QHBoxLayout()
+        search_layout.addWidget(QLabel("UP主UID:"))
+        self.uploader_uid_input = QLineEdit()
+        self.uploader_uid_input.setFixedWidth(150)
+        self.uploader_uid_input.setPlaceholderText("输入UP主UID")
+        self.uploader_uid_input.returnPressed.connect(self._on_uploader_query)
+        btn_search = QPushButton("查询")
+        btn_search.setFixedSize(70, 32)
+        btn_search.clicked.connect(lambda: self._on_uploader_query(1))
+        btn_add_all = QPushButton("全部下载")
+        btn_add_all.setFixedSize(90, 32)
+        btn_add_all.clicked.connect(lambda: self._add_all_uploader_videos())
+        btn_add_selected = QPushButton("下载选中")
+        btn_add_selected.setFixedSize(90, 32)
+        btn_add_selected.clicked.connect(lambda: self._add_selected_uploader_videos())
+        search_layout.addWidget(self.uploader_uid_input)
+        search_layout.addWidget(btn_search)
+        search_layout.addSpacing(20)
+        search_layout.addWidget(btn_add_selected)
+        search_layout.addWidget(btn_add_all)
+        search_layout.addStretch()
+        layout.addLayout(search_layout)
+
+        # UP主信息区域
+        self.uploader_info_frame = QFrame()
+        self.uploader_info_frame.setStyleSheet("QFrame { background-color: #f9f9f9; border: 1px solid #ddd; border-radius: 6px; }")
+        self.uploader_info_frame.setMinimumHeight(80)
+        info_layout = QHBoxLayout(self.uploader_info_frame)
+        info_layout.setContentsMargins(10, 8, 10, 8)
+
+        self.uploader_face_label = QLabel()
+        self.uploader_face_label.setFixedSize(64, 64)
+        self.uploader_face_label.setStyleSheet("QLabel { background-color: #e8e8e8; border: 1px solid #ccc; }")
+
+        info_text_layout = QVBoxLayout()
+        info_text_layout.setSpacing(2)
+        self.uploader_name_label = QLabel("UP主: -")
+        self.uploader_name_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #333;")
+        self.uploader_stats_label = QLabel("投稿: 0 | 粉丝: 0")
+        self.uploader_stats_label.setStyleSheet("font-size: 12px; color: #666;")
+        self.uploader_sign_label = QLabel("签名: -")
+        self.uploader_sign_label.setStyleSheet("font-size: 12px; color: #888;")
+        self.uploader_sign_label.setWordWrap(True)
+
+        info_text_layout.addWidget(self.uploader_name_label)
+        info_text_layout.addWidget(self.uploader_stats_label)
+        info_text_layout.addWidget(self.uploader_sign_label)
+
+        info_layout.addWidget(self.uploader_face_label)
+        info_layout.addSpacing(10)
+        info_layout.addLayout(info_text_layout, 1)
+        layout.addWidget(self.uploader_info_frame)
+
+        # 视频列表
+        self.uploader_video_table = QTableWidget()
+        self.uploader_video_table.setColumnCount(6)
+        self.uploader_video_table.setHorizontalHeaderLabels(["选择", "封面", "标题", "时长", "播放量", "BV号"])
+        self.uploader_video_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.uploader_video_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
+        self.uploader_video_table.setColumnWidth(1, 100)
+        self.uploader_video_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.uploader_video_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.uploader_video_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.uploader_video_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.uploader_video_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.uploader_video_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.uploader_video_table.setAlternatingRowColors(True)
+        self.uploader_video_table.verticalHeader().setDefaultSectionSize(60)
+        self.uploader_video_table.setIconSize(QSize(96, 54))
+        self.uploader_video_table.cellClicked.connect(self._on_uploader_row_clicked)
+        layout.addWidget(self.uploader_video_table, 1)
+
+        # 分页控制
+        page_layout = QHBoxLayout()
+        self.uploader_page_label = QLabel("第 0/0 页，共 0 个视频")
+        self.uploader_page_label.setStyleSheet("color: #666;")
+        self.btn_uploader_prev = QPushButton("上一页")
+        self.btn_uploader_prev.setFixedSize(70, 28)
+        self.btn_uploader_prev.clicked.connect(lambda: self._uploader_prev_page())
+        self.btn_uploader_next = QPushButton("下一页")
+        self.btn_uploader_next.setFixedSize(70, 28)
+        self.btn_uploader_next.clicked.connect(lambda: self._uploader_next_page())
+        page_layout.addWidget(self.uploader_page_label)
+        page_layout.addStretch()
+        page_layout.addWidget(self.btn_uploader_prev)
+        page_layout.addWidget(self.btn_uploader_next)
+        layout.addLayout(page_layout)
+
+        # 初始化状态
+        self.uploader_videos = []
+        self.uploader_current_page = 1
+        self.uploader_total_pages = 0
+        self.uploader_total_count = 0
+        self.uploader_query_worker = None
+        self._cover_loader = None
+        self._face_loader = None
+        self.uploader_mid = None
+        self._uploader_query_lock = False
+        self._uploader_generation = 0
+        self._running_threads = []  # 保持线程引用防GC
+
+        return page
+
+    def _create_collection_page(self):
+        """创建合集/收藏夹查询页面"""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+
+        # 顶部搜索栏
+        search_layout = QHBoxLayout()
+        search_layout.addWidget(QLabel("输入:"))
+        self.collection_input = QLineEdit()
+        self.collection_input.setFixedWidth(300)
+        self.collection_input.setPlaceholderText("输入视频链接/BV号查询合集，或收藏夹ID")
+        self.collection_input.returnPressed.connect(self._on_collection_query)
+        btn_search = QPushButton("查询")
+        btn_search.setFixedSize(70, 32)
+        btn_search.clicked.connect(lambda: self._on_collection_query())
+
+        # 模式切换
+        self.collection_mode_combo = QComboBox()
+        self.collection_mode_combo.setFixedWidth(100)
+        self.collection_mode_combo.addItems(["自动识别", "合集查询", "收藏夹查询"])
+
+        btn_add_all = QPushButton("全部下载")
+        btn_add_all.setFixedSize(90, 32)
+        btn_add_all.clicked.connect(lambda: self._add_all_collection_videos())
+        btn_add_selected = QPushButton("下载选中")
+        btn_add_selected.setFixedSize(90, 32)
+        btn_add_selected.clicked.connect(lambda: self._add_selected_collection_videos())
+
+        search_layout.addWidget(self.collection_input)
+        search_layout.addWidget(self.collection_mode_combo)
+        search_layout.addWidget(btn_search)
+        search_layout.addSpacing(20)
+        search_layout.addWidget(btn_add_selected)
+        search_layout.addWidget(btn_add_all)
+        search_layout.addStretch()
+        layout.addLayout(search_layout)
+
+        # 信息区域
+        self.collection_info_frame = QFrame()
+        self.collection_info_frame.setStyleSheet("QFrame { background-color: #f9f9f9; border: 1px solid #ddd; border-radius: 6px; }")
+        self.collection_info_frame.setMinimumHeight(60)
+        info_layout = QHBoxLayout(self.collection_info_frame)
+        info_layout.setContentsMargins(10, 8, 10, 8)
+
+        self.collection_cover_label = QLabel()
+        self.collection_cover_label.setFixedSize(64, 64)
+        self.collection_cover_label.setStyleSheet("QLabel { background-color: #e8e8e8; border: 1px solid #ccc; }")
+        self.collection_cover_label.setAlignment(Qt.AlignCenter)
+
+        info_text_layout = QVBoxLayout()
+        info_text_layout.setSpacing(2)
+        self.collection_title_label = QLabel("合集/收藏夹: -")
+        self.collection_title_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #333;")
+        self.collection_stats_label = QLabel("视频数: 0")
+        self.collection_stats_label.setStyleSheet("font-size: 12px; color: #666;")
+
+        info_text_layout.addWidget(self.collection_title_label)
+        info_text_layout.addWidget(self.collection_stats_label)
+
+        info_layout.addWidget(self.collection_cover_label)
+        info_layout.addSpacing(10)
+        info_layout.addLayout(info_text_layout, 1)
+        layout.addWidget(self.collection_info_frame)
+
+        # 视频列表
+        self.collection_video_table = QTableWidget()
+        self.collection_video_table.setColumnCount(6)
+        self.collection_video_table.setHorizontalHeaderLabels(["选择", "封面", "标题", "UP主", "时长", "BV号"])
+        self.collection_video_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.collection_video_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
+        self.collection_video_table.setColumnWidth(1, 100)
+        self.collection_video_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.collection_video_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.collection_video_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.collection_video_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.collection_video_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.collection_video_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.collection_video_table.setAlternatingRowColors(True)
+        self.collection_video_table.verticalHeader().setDefaultSectionSize(60)
+        self.collection_video_table.setIconSize(QSize(96, 54))
+        self.collection_video_table.cellClicked.connect(self._on_collection_row_clicked)
+        layout.addWidget(self.collection_video_table, 1)
+
+        # 分页控制
+        page_layout = QHBoxLayout()
+        self.collection_page_label = QLabel("共 0 个视频")
+        self.collection_page_label.setStyleSheet("color: #666;")
+        self.btn_collection_prev = QPushButton("上一页")
+        self.btn_collection_prev.setFixedSize(70, 28)
+        self.btn_collection_prev.setEnabled(False)
+        self.btn_collection_prev.clicked.connect(lambda: self._collection_prev_page())
+        self.btn_collection_next = QPushButton("下一页")
+        self.btn_collection_next.setFixedSize(70, 28)
+        self.btn_collection_next.setEnabled(False)
+        self.btn_collection_next.clicked.connect(lambda: self._collection_next_page())
+        page_layout.addWidget(self.collection_page_label)
+        page_layout.addStretch()
+        page_layout.addWidget(self.btn_collection_prev)
+        page_layout.addWidget(self.btn_collection_next)
+        layout.addLayout(page_layout)
+
+        # 初始化状态
+        self.collection_videos = []
+        self.collection_current_page = 1
+        self.collection_total_pages = 1
+        self.collection_total_count = 0
+        self.collection_query_worker = None
+        self._collection_cover_loader = None  # BatchCoverLoader for video covers
+        self._collection_info_cover_loader = None  # FaceLoader for info cover
+        self._collection_query_lock = False
+        self._collection_generation = 0
+        self._collection_type = None  # "collection" or "favlist"
+        self._collection_query_input = None
+
         return page
 
     def _create_download_page(self):
@@ -1503,6 +2147,612 @@ class MainWindow(QMainWindow):
                 160, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
             self.cover_label.setPixmap(pixmap)
+
+    # ---- Uploader Query ----
+
+    def _on_uploader_query(self, page=1, skip_info=False):
+        """查询UP主视频"""
+        if self._uploader_query_lock:
+            return
+
+        text = self.uploader_uid_input.text().strip()
+        if not text:
+            QMessageBox.warning(self, "提示", "请输入UP主UID")
+            return
+
+        try:
+            mid = int(text)
+        except ValueError:
+            QMessageBox.warning(self, "提示", "UID必须是数字")
+            return
+
+        # 锁定查询，禁用按钮
+        self._uploader_query_lock = True
+        self._uploader_generation += 1
+        gen = self._uploader_generation
+        self.btn_uploader_prev.setEnabled(False)
+        self.btn_uploader_next.setEnabled(False)
+
+        self.uploader_mid = mid
+        self.uploader_current_page = page
+        self.log(f"正在查询UP主: {mid}", "INFO")
+
+        # 停止旧的后台线程
+        self._stop_running_threads()
+
+        # 断开旧worker信号
+        if self.uploader_query_worker:
+            try:
+                self.uploader_query_worker.log_signal.disconnect(self.log)
+                self.uploader_query_worker.info_signal.disconnect(self._on_uploader_info)
+                self.uploader_query_worker.videos_signal.disconnect(self._on_uploader_videos)
+                self.uploader_query_worker.error_signal.disconnect(self._on_uploader_error)
+            except (RuntimeError, TypeError):
+                pass
+
+        self.uploader_query_worker = UploaderQueryWorker(self.client, mid, page, 20, skip_info=skip_info)
+
+        def _on_info(info):
+            if self._uploader_generation != gen:
+                return
+            self._on_uploader_info(info)
+
+        def _on_videos(videos, total, page_count):
+            if self._uploader_generation != gen:
+                return
+            self._on_uploader_videos(videos, total, page_count)
+
+        def _on_error(msg):
+            if self._uploader_generation != gen:
+                return
+            self._on_uploader_error(msg)
+
+        self.uploader_query_worker.log_signal.connect(self.log)
+        self.uploader_query_worker.info_signal.connect(_on_info)
+        self.uploader_query_worker.videos_signal.connect(_on_videos)
+        self.uploader_query_worker.error_signal.connect(_on_error)
+        self._running_threads.append(self.uploader_query_worker)
+        self.uploader_query_worker.start()
+
+    def _stop_running_threads(self):
+        """停止所有后台线程"""
+        if self._cover_loader:
+            if hasattr(self._cover_loader, 'stop'):
+                self._cover_loader.stop()
+            try:
+                self._cover_loader.loaded.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            self._cover_loader = None
+
+        if self._face_loader:
+            if hasattr(self._face_loader, 'stop'):
+                self._face_loader.stop()
+            try:
+                self._face_loader.loaded.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            self._face_loader = None
+
+        # 清理已完成的线程引用
+        self._running_threads = [t for t in self._running_threads if t and t.isRunning()]
+
+    def _on_uploader_row_clicked(self, row, col):
+        """点击行时切换选中状态"""
+        item = self.uploader_video_table.item(row, 0)
+        if item:
+            new_state = Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked
+            item.setCheckState(new_state)
+
+    def _on_uploader_info(self, info):
+        """UP主信息回调"""
+        self.uploader_name_label.setText(f"UP主: {info.get('name', '未知')}")
+        self.uploader_stats_label.setText(f"投稿: {format_count(info.get('video', 0))} | 粉丝: {format_count(info.get('follower', 0))}")
+        sign = info.get("sign", "") or "无签名"
+        self.uploader_sign_label.setText(f"签名: {sign[:30]}{'...' if len(sign) > 30 else ''}")
+
+        face_url = info.get("face", "")
+        if face_url:
+            self._load_uploader_face(face_url)
+
+    def _load_uploader_face(self, url):
+        """异步加载UP主头像"""
+        gen = self._uploader_generation
+
+        if self._face_loader:
+            try:
+                self._face_loader.stop()
+                self._face_loader.loaded.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            self._face_loader = None
+
+        self._face_loader = FaceLoader(url)
+
+        def _on_face(data):
+            if self._uploader_generation != gen:
+                return
+            self._on_face_loaded(data)
+
+        self._face_loader.loaded.connect(_on_face)
+        self._running_threads.append(self._face_loader)
+        self._face_loader.start()
+
+    def _on_face_loaded(self, data):
+        """头像加载完成回调"""
+        img = QImage()
+        img.loadFromData(data)
+        if not img.isNull():
+            pixmap = QPixmap.fromImage(img).scaled(64, 64, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            mask = QPixmap(64, 64)
+            mask.fill(Qt.transparent)
+            p = QPainter(mask)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setBrush(Qt.white)
+            p.setPen(Qt.NoPen)
+            p.drawEllipse(0, 0, 64, 64)
+            p.end()
+            pixmap.setMask(mask.createMaskFromColor(Qt.black))
+            self.uploader_face_label.setPixmap(pixmap)
+
+    def _on_uploader_videos(self, videos, total, page_count):
+        """视频列表回调"""
+        self.uploader_videos = videos
+        self.uploader_total_count = total
+        self.uploader_total_pages = page_count
+
+        self.uploader_page_label.setText(f"第 {self.uploader_current_page}/{page_count} 页，共 {total} 个视频")
+
+        self.uploader_video_table.setUpdatesEnabled(False)
+        self.uploader_video_table.setRowCount(len(videos))
+        for i, v in enumerate(videos):
+            chk_item = QTableWidgetItem()
+            chk_item.setCheckState(Qt.Unchecked)
+            chk_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            self.uploader_video_table.setItem(i, 0, chk_item)
+
+            # 封面占位
+            cover_item = QTableWidgetItem("加载中...")
+            cover_item.setFlags(Qt.ItemIsEnabled)
+            cover_item.setTextAlignment(Qt.AlignCenter)
+            self.uploader_video_table.setItem(i, 1, cover_item)
+
+            self.uploader_video_table.setItem(i, 2, QTableWidgetItem(v.get("title", "")))
+
+            duration = v.get("duration", 0)
+            mins, secs = divmod(duration, 60)
+            self.uploader_video_table.setItem(i, 3, QTableWidgetItem(f"{mins}:{secs:02d}"))
+
+            self.uploader_video_table.setItem(i, 4, QTableWidgetItem(format_count(v.get("play", 0))))
+
+            self.uploader_video_table.setItem(i, 5, QTableWidgetItem(v.get("bvid", "")))
+
+        self.uploader_video_table.setUpdatesEnabled(True)
+
+        # 异步加载封面
+        self._load_uploader_covers(videos)
+
+        # 解锁
+        self._uploader_query_lock = False
+        self.btn_uploader_prev.setEnabled(self.uploader_current_page > 1)
+        self.btn_uploader_next.setEnabled(self.uploader_current_page < page_count)
+
+    def _on_uploader_error(self, msg):
+        """UP主查询错误"""
+        self.log(msg, "ERROR")
+        QMessageBox.warning(self, "查询失败", msg)
+        self._uploader_query_lock = False
+        self.btn_uploader_prev.setEnabled(self.uploader_current_page > 1)
+        self.btn_uploader_next.setEnabled(self.uploader_current_page < self.uploader_total_pages)
+
+    def _load_uploader_covers(self, videos):
+        """异步加载视频封面"""
+        gen = self._uploader_generation
+
+        # 停止旧线程
+        if self._cover_loader:
+            try:
+                self._cover_loader.stop()
+                self._cover_loader.loaded.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            self._cover_loader = None
+
+        self._cover_loader = BatchCoverLoader(videos)
+
+        def _on_cover(row, data):
+            if self._uploader_generation != gen:
+                return
+            self._on_cover_loaded_for_row(row, data)
+
+        self._cover_loader.loaded.connect(_on_cover)
+        self._running_threads.append(self._cover_loader)
+        self._cover_loader.start()
+
+    def _on_cover_loaded_for_row(self, row, data):
+        """单行封面加载完成"""
+        if row >= self.uploader_video_table.rowCount():
+            return
+        img = QImage()
+        img.loadFromData(data)
+        if not img.isNull():
+            pixmap = QPixmap.fromImage(img).scaled(
+                96, 54, Qt.IgnoreAspectRatio, Qt.SmoothTransformation
+            )
+            item = self.uploader_video_table.item(row, 1)
+            if item:
+                item.setIcon(QIcon(pixmap))
+                item.setText("")
+
+    def _uploader_prev_page(self):
+        """上一页"""
+        if self._uploader_query_lock:
+            return
+        if self.uploader_current_page > 1:
+            self._on_uploader_query(self.uploader_current_page - 1, skip_info=True)
+
+    def _uploader_next_page(self):
+        """下一页"""
+        if self._uploader_query_lock:
+            return
+        if self.uploader_current_page < self.uploader_total_pages:
+            self._on_uploader_query(self.uploader_current_page + 1, skip_info=True)
+
+    def _add_selected_uploader_videos(self):
+        """下载选中的视频"""
+        if not self.uploader_videos:
+            QMessageBox.warning(self, "提示", "请先查询UP主视频")
+            return
+
+        if not self._ffmpeg_available:
+            QMessageBox.warning(self, "警告", "未检测到ffmpeg，无法下载")
+            return
+
+        selected = []
+        for i in range(self.uploader_video_table.rowCount()):
+            item = self.uploader_video_table.item(i, 0)
+            if item and item.checkState() == Qt.Checked:
+                selected.append(self.uploader_videos[i])
+
+        if not selected:
+            QMessageBox.warning(self, "提示", "请选择要下载的视频")
+            return
+
+        qn = self.client.config.get("default_qn", 80)
+        up_name = self.uploader_name_label.text().replace("UP主: ", "")
+        
+        for v in selected:
+            self.download_manager.add_task(
+                v["bvid"], None, v["title"], up_name, qn, 0
+            )
+        
+        self.log(f"已添加 {len(selected)} 个下载任务", "INFO")
+        self._update_dl_status()
+
+    def _add_all_uploader_videos(self):
+        """下载当前页所有视频"""
+        if not self.uploader_videos:
+            QMessageBox.warning(self, "提示", "请先查询UP主视频")
+            return
+
+        if not self._ffmpeg_available:
+            QMessageBox.warning(self, "警告", "未检测到ffmpeg，无法下载")
+            return
+
+        reply = QMessageBox.question(
+            self, "确认", f"确定要下载当前页的 {len(self.uploader_videos)} 个视频吗？",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.No:
+            return
+
+        qn = self.client.config.get("default_qn", 80)
+        up_name = self.uploader_name_label.text().replace("UP主: ", "")
+        
+        for v in self.uploader_videos:
+            self.download_manager.add_task(
+                v["bvid"], None, v["title"], up_name, qn, 0
+            )
+        
+        self.log(f"已添加 {len(self.uploader_videos)} 个下载任务", "INFO")
+        self._update_dl_status()
+
+    # ---- Collection / Favlist Query ----
+
+    def _parse_favlist_id(self, text):
+        """从收藏夹链接中提取fid，如 https://space.bilibili.com/xxx/favlist?fid=123456"""
+        import re
+        m = re.search(r'fid=(\d+)', text)
+        if m:
+            return m.group(1)
+        return None
+
+    def _on_collection_query(self, page=1):
+        """查询合集/收藏夹"""
+        if self._collection_query_lock:
+            return
+
+        text = self.collection_input.text().strip()
+        if not text:
+            QMessageBox.warning(self, "提示", "请输入视频链接/BV号或收藏夹ID")
+            return
+
+        # 判断查询类型
+        mode = self.collection_mode_combo.currentIndex()
+        if mode == 0:  # 自动识别
+            bvid = self.client.parse_bv(text)
+            if bvid:
+                query_type = "collection"
+            else:
+                # 尝试从收藏夹链接中提取fid
+                fid = self._parse_favlist_id(text)
+                if fid:
+                    text = fid
+                    query_type = "favlist"
+                else:
+                    try:
+                        int(text)
+                        query_type = "favlist"
+                    except ValueError:
+                        QMessageBox.warning(self, "提示", "无法识别输入类型，请输入BV号/链接或收藏夹ID")
+                        return
+        elif mode == 1:
+            query_type = "collection"
+        else:
+            query_type = "favlist"
+            # 收藏夹模式下也尝试从链接提取fid
+            fid = self._parse_favlist_id(text)
+            if fid:
+                text = fid
+
+        # 锁定
+        self._collection_query_lock = True
+        self._collection_generation += 1
+        gen = self._collection_generation
+        self._collection_type = query_type
+        self._collection_query_input = text
+        self.collection_current_page = page
+
+        # 停止旧封面加载
+        for loader_attr in ('_collection_cover_loader', '_collection_info_cover_loader'):
+            loader = getattr(self, loader_attr, None)
+            if loader:
+                if hasattr(loader, 'stop'):
+                    loader.stop()
+                try:
+                    loader.loaded.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+                setattr(self, loader_attr, None)
+
+        # 断开旧worker信号
+        if self.collection_query_worker:
+            try:
+                self.collection_query_worker.log_signal.disconnect()
+                self.collection_query_worker.info_signal.disconnect()
+                self.collection_query_worker.videos_signal.disconnect()
+                self.collection_query_worker.error_signal.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+
+        self.collection_query_worker = CollectionQueryWorker(self.client, query_type, text, page, 20)
+
+        def _on_info(info):
+            if self._collection_generation != gen:
+                return
+            self._on_collection_info(info)
+
+        def _on_videos(videos, total, page_count):
+            if self._collection_generation != gen:
+                return
+            self._on_collection_videos(videos, total, page_count)
+
+        def _on_error(msg):
+            if self._collection_generation != gen:
+                return
+            self._on_collection_error(msg)
+
+        self.collection_query_worker.log_signal.connect(self.log)
+        self.collection_query_worker.info_signal.connect(_on_info)
+        self.collection_query_worker.videos_signal.connect(_on_videos)
+        self.collection_query_worker.error_signal.connect(_on_error)
+        self.collection_query_worker.start()
+
+    def _on_collection_info(self, info):
+        """合集/收藏夹信息回调"""
+        ctype = "合集" if info.get("type") == "collection" else "收藏夹"
+        self.collection_title_label.setText(f"{ctype}: {info.get('title', '未知')}")
+        self.collection_stats_label.setText(f"视频数: {info.get('count', 0)}")
+
+        cover_url = info.get("cover", "")
+        if cover_url:
+            self._load_collection_cover(cover_url)
+
+    def _load_collection_cover(self, url):
+        """异步加载合集/收藏夹封面"""
+        gen = self._collection_generation
+
+        if self._collection_info_cover_loader:
+            try:
+                self._collection_info_cover_loader.stop()
+                self._collection_info_cover_loader.loaded.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+
+        self._collection_info_cover_loader = FaceLoader(url)
+
+        def _on_cover(data):
+            if self._collection_generation != gen:
+                return
+            img = QImage()
+            img.loadFromData(data)
+            if not img.isNull():
+                pixmap = QPixmap.fromImage(img).scaled(64, 64, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+                self.collection_cover_label.setPixmap(pixmap)
+
+        self._collection_info_cover_loader.loaded.connect(_on_cover)
+        self._collection_info_cover_loader.start()
+
+    def _on_collection_videos(self, videos, total, page_count):
+        """视频列表回调"""
+        self.collection_videos = videos
+        self.collection_total_count = total
+        self.collection_total_pages = page_count
+
+        self.collection_page_label.setText(
+            f"第 {self.collection_current_page}/{page_count} 页，共 {total} 个视频"
+        )
+
+        self.collection_video_table.setUpdatesEnabled(False)
+        self.collection_video_table.setRowCount(len(videos))
+        for i, v in enumerate(videos):
+            chk_item = QTableWidgetItem()
+            chk_item.setCheckState(Qt.Unchecked)
+            chk_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            self.collection_video_table.setItem(i, 0, chk_item)
+
+            cover_item = QTableWidgetItem("加载中...")
+            cover_item.setFlags(Qt.ItemIsEnabled)
+            cover_item.setTextAlignment(Qt.AlignCenter)
+            self.collection_video_table.setItem(i, 1, cover_item)
+
+            self.collection_video_table.setItem(i, 2, QTableWidgetItem(v.get("title", "")))
+            self.collection_video_table.setItem(i, 3, QTableWidgetItem(v.get("owner_name", "")))
+
+            duration = v.get("duration", 0)
+            mins, secs = divmod(duration, 60)
+            self.collection_video_table.setItem(i, 4, QTableWidgetItem(f"{mins}:{secs:02d}"))
+            self.collection_video_table.setItem(i, 5, QTableWidgetItem(v.get("bvid", "")))
+
+        self.collection_video_table.setUpdatesEnabled(True)
+
+        # 异步加载封面
+        self._load_collection_covers(videos)
+
+        # 解锁
+        self._collection_query_lock = False
+        self.btn_collection_prev.setEnabled(self.collection_current_page > 1)
+        self.btn_collection_next.setEnabled(self.collection_current_page < page_count)
+
+    def _on_collection_error(self, msg):
+        """查询错误回调"""
+        self.log(msg, "ERROR")
+        QMessageBox.warning(self, "查询失败", msg)
+        self._collection_query_lock = False
+        self.btn_collection_prev.setEnabled(self.collection_current_page > 1)
+        self.btn_collection_next.setEnabled(self.collection_current_page < self.collection_total_pages)
+
+    def _load_collection_covers(self, videos):
+        """异步加载视频封面"""
+        gen = self._collection_generation
+
+        # 停止旧线程
+        if self._collection_cover_loader:
+            try:
+                self._collection_cover_loader.stop()
+                self._collection_cover_loader.loaded.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            self._collection_cover_loader = None
+
+        self._collection_cover_loader = BatchCoverLoader(videos)
+
+        def _on_cover(row, data):
+            if self._collection_generation != gen:
+                return
+            self._on_collection_cover_loaded(row, data)
+
+        self._collection_cover_loader.loaded.connect(_on_cover)
+        self._collection_cover_loader.start()
+
+    def _on_collection_cover_loaded(self, row, data):
+        """单行封面加载完成"""
+        if row >= self.collection_video_table.rowCount():
+            return
+        img = QImage()
+        img.loadFromData(data)
+        if not img.isNull():
+            pixmap = QPixmap.fromImage(img).scaled(
+                96, 54, Qt.IgnoreAspectRatio, Qt.SmoothTransformation
+            )
+            item = self.collection_video_table.item(row, 1)
+            if item:
+                item.setIcon(QIcon(pixmap))
+                item.setText("")
+
+    def _on_collection_row_clicked(self, row, col):
+        """点击行时切换选中状态"""
+        item = self.collection_video_table.item(row, 0)
+        if item:
+            new_state = Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked
+            item.setCheckState(new_state)
+
+    def _collection_prev_page(self):
+        """上一页"""
+        if self._collection_query_lock:
+            return
+        if self.collection_current_page > 1:
+            self._on_collection_query(self.collection_current_page - 1)
+
+    def _collection_next_page(self):
+        """下一页"""
+        if self._collection_query_lock:
+            return
+        if self.collection_current_page < self.collection_total_pages:
+            self._on_collection_query(self.collection_current_page + 1)
+
+    def _add_selected_collection_videos(self):
+        """下载选中的视频"""
+        if not self.collection_videos:
+            QMessageBox.warning(self, "提示", "请先查询合集/收藏夹")
+            return
+
+        if not self._ffmpeg_available:
+            QMessageBox.warning(self, "警告", "未检测到ffmpeg，无法下载")
+            return
+
+        selected = []
+        for i in range(self.collection_video_table.rowCount()):
+            item = self.collection_video_table.item(i, 0)
+            if item and item.checkState() == Qt.Checked:
+                selected.append(self.collection_videos[i])
+
+        if not selected:
+            QMessageBox.warning(self, "提示", "请选择要下载的视频")
+            return
+
+        qn = self.client.config.get("default_qn", 80)
+        for v in selected:
+            up_name = v.get("owner_name", "")
+            self.download_manager.add_task(v["bvid"], None, v["title"], up_name, qn, 0)
+
+        self.log(f"已添加 {len(selected)} 个下载任务", "INFO")
+        self._update_dl_status()
+
+    def _add_all_collection_videos(self):
+        """下载当前页所有视频"""
+        if not self.collection_videos:
+            QMessageBox.warning(self, "提示", "请先查询合集/收藏夹")
+            return
+
+        if not self._ffmpeg_available:
+            QMessageBox.warning(self, "警告", "未检测到ffmpeg，无法下载")
+            return
+
+        reply = QMessageBox.question(
+            self, "确认", f"确定要下载当前页的 {len(self.collection_videos)} 个视频吗？",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.No:
+            return
+
+        qn = self.client.config.get("default_qn", 80)
+        for v in self.collection_videos:
+            up_name = v.get("owner_name", "")
+            self.download_manager.add_task(v["bvid"], None, v["title"], up_name, qn, 0)
+
+        self.log(f"已添加 {len(self.collection_videos)} 个下载任务", "INFO")
+        self._update_dl_status()
 
     # ---- Download ----
 
