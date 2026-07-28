@@ -1,0 +1,282 @@
+name: Release Build
+
+# 触发条件：推送以 "v" 开头的标签时自动执行（如 v1.0.0、v2.1.3-beta）
+on:
+  push:
+    tags:
+      - 'v*'
+
+# 同一标签重复推送时取消旧任务
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # 创建 Release 需要写入权限
+
+jobs:
+  # ====================================================================
+  # 构建 Windows 可执行文件（x64 + ARM64）
+  # ====================================================================
+  build-windows:
+    name: Build Windows (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+            asset_suffix: windows-x64
+          - arch: arm64
+            runner: windows-11-arm
+            asset_suffix: windows-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: ${{ matrix.arch }}
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Install ffmpeg
+        shell: pwsh
+        run: |
+          # 下载 ffmpeg 静态构建，打包进 exe 以满足运行时合并音视频的需求
+          $ProgressPreference = 'SilentlyContinue'
+          $arch = '${{ matrix.arch }}'
+          if ($arch -eq 'arm64') {
+            $url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-arm64-static.zip'
+          } else {
+            $url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+          }
+          try {
+            Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip -UseBasicParsing
+            Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_tmp -Force
+            $ffbin = Get-ChildItem -Path ffmpeg_tmp -Recurse -Filter 'ffmpeg.exe' | Select-Object -First 1
+            if ($ffbin) {
+              New-Item -ItemType Directory -Force -Path 'ffmpeg_bin' | Out-Null
+              Copy-Item $ffbin.FullName 'ffmpeg_bin\ffmpeg.exe'
+              Write-Host "ffmpeg 已下载到 ffmpeg_bin\ffmpeg.exe"
+            } else {
+              Write-Host "未找到 ffmpeg.exe，将跳过打包"
+            }
+          } catch {
+            Write-Host "ffmpeg 下载失败: $_  将跳过打包"
+          }
+
+      - name: Build with PyInstaller
+        shell: pwsh
+        run: |
+          $binArg = ''
+          if (Test-Path 'ffmpeg_bin\ffmpeg.exe') {
+            $binArg = '--add-binary', 'ffmpeg_bin\ffmpeg.exe;.'
+          }
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --windowed `
+            --name 'BiLiganbei' `
+            --collect-all PySide6 `
+            --hidden-import qrcode `
+            --hidden-import PIL `
+            @binArg `
+            bilibili_downloader.py
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}'
+          Compress-Archive -Path 'dist\BiLiganbei.exe' -DestinationPath "BiLiganbei-${version}-${{ matrix.asset_suffix }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_suffix }}
+          path: BiLiganbei-${{ github.ref_name }}-${{ matrix.asset_suffix }}.zip
+
+  # ====================================================================
+  # 构建 macOS 应用程序（.app，x64 + arm64 通用）
+  # ====================================================================
+  build-macos:
+    name: Build macOS (.app)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Install ffmpeg
+        run: |
+          brew install ffmpeg
+          # 将 ffmpeg 二进制复制到项目目录以便打包进 .app
+          mkdir -p ffmpeg_bin
+          cp "$(brew --prefix ffmpeg)/bin/ffmpeg" ffmpeg_bin/ffmpeg
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller \
+            --noconfirm \
+            --clean \
+            --onedir \
+            --windowed \
+            --name 'BiLiganbei' \
+            --collect-all PySide6 \
+            --hidden-import qrcode \
+            --hidden-import PIL \
+            --add-binary "ffmpeg_bin/ffmpeg:." \
+            bilibili_downloader.py
+
+      - name: Package .app into archive
+        run: |
+          version="${{ github.ref_name }}"
+          # 创建包含 .app 的 dmg 或 zip；此处使用 zip 保证兼容性
+          cd dist
+          zip -r -y "../BiLiganbei-${version}-macos.zip" BiLiganbei.app
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: BiLiganbei-${{ github.ref_name }}-macos.zip
+
+  # ====================================================================
+  # 构建 Linux Debian 包（.deb，x64）
+  # ====================================================================
+  build-linux-deb:
+    name: Build Linux (.deb)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Install ffmpeg and packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg dpkg-dev
+          mkdir -p ffmpeg_bin
+          cp "$(which ffmpeg)" ffmpeg_bin/ffmpeg
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller \
+            --noconfirm \
+            --clean \
+            --onedir \
+            --name 'BiLiganbei' \
+            --collect-all PySide6 \
+            --hidden-import qrcode \
+            --hidden-import PIL \
+            --add-binary "ffmpeg_bin/ffmpeg:." \
+            bilibili_downloader.py
+
+      - name: Build .deb package
+        run: |
+          version="${{ github.ref_name }}"
+          # 去除前导 v（v1.0.0 -> 1.0.0）符合 deb 版本规范
+          deb_version="${version#v}"
+          pkgdir="pkg/BiLiganbei"
+          mkdir -p "$pkgdir/usr/local/bin"
+          mkdir -p "$pkgdir/DEBIAN"
+          mkdir -p "$pkgdir/usr/share/applications"
+          mkdir -p "$pkgdir/usr/share/icons/hicolor/256x256/apps"
+
+          # 复制打包结果
+          cp -r dist/BiLiganbei/* "$pkgdir/usr/local/bin/"
+          chmod +x "$pkgdir/usr/local/bin/BiLiganbei"
+
+          # 创建桌面入口文件
+          cat > "$pkgdir/usr/share/applications/biliganbei.desktop" <<EOF
+          [Desktop Entry]
+          Name=BiLiganbei
+          Comment=Bilibili Video Downloader
+          Exec=/usr/local/bin/BiLiganbei
+          Icon=biliganbei
+          Terminal=false
+          Type=Application
+          Categories=AudioVideo;Network;
+          EOF
+
+          # 控制 metadata
+          cat > "$pkgdir/DEBIAN/control" <<EOF
+          Package: biliganbei
+          Version: ${deb_version}
+          Architecture: amd64
+          Maintainer: BiLiganbei <noreply@example.com>
+          Description: Bilibili Video Downloader
+           Bilibili video downloader built with PySide6.
+           Supports QR login, video search and DASH stream download.
+          Depends: libgl1, libegl1, libdbus-1-3, libxkbcommon0
+          Section: video
+          Priority: optional
+          EOF
+
+          # 构建 deb
+          dpkg-deb --build --root-owner-group "$pkgdir" "BiLiganbei-${version}-linux-amd64.deb"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-deb
+          path: BiLiganbei-${{ github.ref_name }}-linux-amd64.deb
+
+  # ====================================================================
+  # 汇总所有产物并创建 GitHub Release
+  # ====================================================================
+  release:
+    name: Create Release
+    needs: [build-windows, build-macos, build-linux-deb]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            artifacts/windows-x64/*
+            artifacts/windows-arm64/*
+            artifacts/macos/*
+            artifacts/linux-deb/*
