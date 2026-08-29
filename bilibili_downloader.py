@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QProgressBar, QDialog, QFileDialog,
     QHeaderView, QSplitter, QFrame, QMessageBox, QAbstractItemView,
     QSizePolicy, QComboBox, QGridLayout, QGroupBox, QTabWidget,
-    QScrollArea, QSpinBox, QSpacerItem
+    QScrollArea, QSpinBox, QSpacerItem, QCheckBox
 )
 from PySide6.QtCore import Qt, Signal, QThread, QSize, QObject, QTimer
 from PySide6.QtGui import QPixmap, QImage, QColor, QFont, QIcon, QPainter
@@ -109,6 +109,347 @@ def get_download_dir():
 
 
 # ============================================================
+# 弹幕 Protobuf 解析 (对齐 pilipala 的 seg.so 接口)
+# ============================================================
+
+def _read_varint(data, offset):
+    """读取 protobuf varint，返回 (值, 新偏移)"""
+    result = 0
+    shift = 0
+    while offset < len(data):
+        byte = data[offset]
+        offset += 1
+        result |= (byte & 0x7F) << shift
+        if not (byte & 0x80):
+            break
+        shift += 7
+    return result, offset
+
+
+def _parse_danmaku_elem(data):
+    """解析单条 DanmakuElem 消息"""
+    dm = {
+        'id': 0,
+        'progress': 0,
+        'mode': 1,
+        'fontsize': 25,
+        'color': 0xFFFFFF,
+        'midHash': '',
+        'content': '',
+        'ctime': 0,
+        'pool': 0,
+        'weight': 0,
+    }
+    offset = 0
+    while offset < len(data):
+        tag, offset = _read_varint(data, offset)
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if wire_type == 0:  # varint
+            value, offset = _read_varint(data, offset)
+            if field_number == 1:
+                dm['id'] = value
+            elif field_number == 2:
+                dm['progress'] = value
+            elif field_number == 3:
+                dm['mode'] = value
+            elif field_number == 4:
+                dm['fontsize'] = value
+            elif field_number == 5:
+                dm['color'] = value
+            elif field_number == 8:
+                dm['ctime'] = value
+            elif field_number == 9:
+                dm['weight'] = value
+            elif field_number == 11:
+                dm['pool'] = value
+        elif wire_type == 2:  # length-delimited
+            length, offset = _read_varint(data, offset)
+            raw = data[offset:offset + length]
+            offset += length
+            try:
+                value_str = raw.decode('utf-8', errors='replace')
+            except Exception:
+                value_str = ''
+            if field_number == 6:
+                dm['midHash'] = value_str
+            elif field_number == 7:
+                dm['content'] = value_str
+        elif wire_type == 5:
+            offset += 4
+        elif wire_type == 1:
+            offset += 8
+        else:
+            break
+    return dm if dm['content'] else None
+
+
+def _parse_danmaku_seg(data):
+    """解析 DmSegMobileReply，返回弹幕列表"""
+    danmaku_list = []
+    offset = 0
+    while offset < len(data):
+        tag, offset = _read_varint(data, offset)
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if wire_type == 2:  # length-delimited
+            length, offset = _read_varint(data, offset)
+            field_data = data[offset:offset + length]
+            offset += length
+            if field_number == 1:  # DanmakuElem
+                dm = _parse_danmaku_elem(field_data)
+                if dm:
+                    danmaku_list.append(dm)
+        elif wire_type == 0:
+            _, offset = _read_varint(data, offset)
+        elif wire_type == 5:
+            offset += 4
+        elif wire_type == 1:
+            offset += 8
+        else:
+            break
+    return danmaku_list
+
+
+def _merge_danmaku_by_content(danmaku_list, segment_ms=360000):
+    """合并相同内容弹幕 (参照 PiliPlus mergeDanmaku)：
+    同一 6 分钟分段内、内容相同的弹幕只保留第一条并累计 count，
+    避免重复刷屏挤占轨道；weight 取合并组内的最大值。
+    """
+    merged = []
+    seen = {}
+    for dm in danmaku_list:
+        seg = dm['progress'] // segment_ms
+        key = (seg, dm['content'])
+        first = seen.get(key)
+        if first is None:
+            dm['count'] = 1
+            seen[key] = dm
+            merged.append(dm)
+        else:
+            first['count'] += 1
+            first['weight'] = max(first.get('weight', 0), dm.get('weight', 0))
+    return merged
+
+
+def _rgb_to_ass_bgr(color):
+    """B站十进制RGB转ASS的 &HBBGGRR 格式 (无尾部&)"""
+    r = (color >> 16) & 0xFF
+    g = (color >> 8) & 0xFF
+    b = color & 0xFF
+    return f"&H{b:02X}{g:02X}{r:02X}"
+
+
+def _format_ass_time(seconds):
+    """将秒数格式化为 ASS 时间格式 H:MM:SS.CS"""
+    if seconds < 0:
+        seconds = 0
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    centi = int((seconds * 100) % 100)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{centi:02d}"
+
+
+def _estimate_text_width(text, font_size):
+    """估算弹幕文本像素宽度 (中文≈字号宽度, 英文≈字号*0.6)"""
+    width = 0
+    for ch in text:
+        if ord(ch) > 0x4E00:  # CJK
+            width += font_size
+        else:
+            width += font_size * 0.6
+    return int(width)
+
+
+class _DanmakuLayout:
+    """弹幕轨道布局，碰撞检测避免弹幕重叠 (参照 bilibili ASS 导出风格)"""
+    def __init__(self, play_res_x, play_res_y, font_size=15, line_height=1.4,
+                 show_area=0.6, skip_overflow=True):
+        self.play_res_x = play_res_x
+        self.play_res_y = play_res_y
+        self.font_size = font_size
+        # 行高 = 字号 * line_height (参照 PiliPlus danmakuLineHeight，下限14)
+        self.track_height = max(14, int(font_size * line_height))
+        self.show_area = show_area  # 滚动弹幕显示区域占屏幕高度比例 (参照 PiliPlus danmakuShowArea)
+        self.skip_overflow = skip_overflow  # 无空闲轨道时丢弃弹幕 (True) 或复用轨道 (False)
+        self.scroll_tracks = []   # (end_time, y)
+        self.fix_top_tracks = []  # (end_time, y)
+        self.fix_bottom_tracks = []  # (end_time, y)
+        self._overflow_round = 0  # 溢出复用轮换计数器，均匀分配同最早时刻的轨道
+
+    def _find_track(self, tracks, start_time, duration, y_start, max_tracks):
+        """在轨道中找空闲位置；全部占用时按 skip_overflow 决定丢弃或复用最早结束的轨道"""
+        end_time = start_time + duration
+        # 统计每条轨道上已有弹幕的最大 end_time（<= start_time 视为空闲）
+        track_end = {}
+        for t_end, y in tracks:
+            track_end[y] = max(track_end.get(y, 0.0), t_end)
+        # 优先按顺序找第一个空闲轨道
+        for i in range(max_tracks):
+            y = y_start + i * self.track_height
+            if track_end.get(y, 0.0) <= start_time:
+                tracks.append((end_time, y))
+                return y
+        # 全部轨道都忙
+        if self.skip_overflow:
+            # 丢弃该弹幕，避免水平重叠遮挡 (参照 PiliPlus canvas 碰撞检测的跳过行为)
+            return None
+        # 复用"占用最早结束"的轨道，溢出弹幕通过轮换分散到不同行
+        min_end = min(track_end.get(y_start + i * self.track_height, 0.0)
+                      for i in range(max_tracks))
+        candidates = [y_start + i * self.track_height for i in range(max_tracks)
+                      if track_end.get(y_start + i * self.track_height, 0.0) == min_end]
+        best_y = candidates[self._overflow_round % len(candidates)]
+        self._overflow_round += 1
+        tracks.append((end_time, best_y))
+        return best_y
+
+    def get_scroll_y(self, start_time, duration):
+        """滚动弹幕 y 坐标 (从上往下排，显示区域受 show_area 限制)"""
+        area_height = self.play_res_y * self.show_area
+        max_tracks = max(1, int((area_height - self.track_height) // self.track_height))
+        return self._find_track(self.scroll_tracks, start_time, duration, self.track_height, max_tracks)
+
+    def get_top_y(self, start_time, duration):
+        """顶部弹幕 y 坐标 (留出上边距)"""
+        top_margin = self.track_height * 2  # 顶部留2个轨道高度的边距
+        max_tracks = max(1, (self.play_res_y // 3) // self.track_height)
+        return self._find_track(self.fix_top_tracks, start_time, duration, top_margin, max_tracks)
+
+    def get_bottom_y(self, start_time, duration):
+        """底部弹幕 y 坐标 (从下往上排，留出下边距)"""
+        bottom_margin = self.track_height * 2  # 底部留2个轨道高度的边距
+        max_tracks = max(1, (self.play_res_y // 3) // self.track_height)
+        y = self._find_track(self.fix_bottom_tracks, start_time, duration, bottom_margin, max_tracks)
+        if y is None:  # 轨道满且 skip_overflow=True 时丢弃
+            return None
+        return self.play_res_y - y - self.track_height
+
+
+def _danmaku_list_to_ass(danmaku_list, play_res_x=560, play_res_y=420, font_size=15,
+                         scroll_duration=12.0, fix_duration=4.0, line_height=1.4,
+                         show_area=0.6, merge=True, weight_filter=0, skip_overflow=True):
+    """将弹幕列表转换为 ASS 字幕格式。
+    样式参照 B站官方 ASS 导出: 黑体不透明(100%)、Fix+R2L 双样式、轨道碰撞检测。
+    兼容 PotPlayer / mpv / VLC / MPC-HC 等主流播放器。
+    """
+    if not danmaku_list:
+        return ""
+
+    # 合并相同内容弹幕 (参照 PiliPlus mergeDanmaku)，降低重复刷屏密度
+    if merge:
+        danmaku_list = _merge_danmaku_by_content(danmaku_list)
+    # 权重过滤 (参照 PiliPlus 智能云屏蔽): 丢弃 weight < weight_filter 的弹幕
+    if weight_filter > 0:
+        danmaku_list = [d for d in danmaku_list if d.get('weight', 0) >= weight_filter]
+    if not danmaku_list:
+        return ""
+
+    sorted_dm = sorted(danmaku_list, key=lambda d: d['progress'])
+    layout = _DanmakuLayout(play_res_x, play_res_y, font_size, line_height, show_area, skip_overflow)
+
+    # ASS 文件头 (参照样例文件)
+    header = f"""[Script Info]
+Title: https://www.bilibili.com/video/,https://comment.bilibili.com/
+ScriptType: v4.00+
+Collisions: Normal
+PlayResX: {play_res_x}
+PlayResY: {play_res_y}
+Timer: 10.0000
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Fix,黑体,{font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0.00,0.00,1,1.00,0.00,2,30,30,30,0
+Style: R2L,黑体,{font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0.00,0.00,1,1.00,0.00,2,30,30,30,0
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    events = []
+    center_x = play_res_x // 2
+
+    for dm in sorted_dm:
+        start_sec = dm['progress'] / 1000.0
+        mode = dm['mode']
+        color = dm['color']
+        content = dm['content']
+        # 合并计数徽标 (参照 PiliPlus ×N 计数)
+        if dm.get('count', 1) > 1:
+            content = f"{content} ×{dm['count']}"
+
+        # 颜色覆盖标签 (仅非白色时添加，参照样例: \c&HBBGGRR 无尾部&)
+        color_tag = ""
+        if color != 0xFFFFFF:
+            color_tag = f"\\c{_rgb_to_ass_bgr(color)}"
+
+        # 统一字号，不使用缩放标签 (参照样例文件: 所有弹幕使用 Style 统一字号)
+
+        # 弹幕类型映射 (参照 B站 ASS 导出):
+        # mode 1,2,3 = 滚动弹幕 (右→左) -> R2L 样式
+        # mode 4 = 底部弹幕 -> Fix 样式, 底部
+        # mode 5 = 顶部弹幕 -> Fix 样式, 顶部
+        # mode 6 = 逆向弹幕 (左→右) -> R2L 样式 (反向 move)
+        # mode 7,8,9 = 高级弹幕 -> 默认按滚动处理
+        if mode in (4,):  # 底部弹幕
+            start_str = _format_ass_time(start_sec)
+            end_str = _format_ass_time(start_sec + fix_duration)
+            y = layout.get_bottom_y(start_sec, fix_duration)
+            if y is None:  # 轨道满且 skip_overflow=True 时丢弃 (参照 PiliPlus 碰撞检测跳过)
+                continue
+            text = f"{{{color_tag}\\pos({center_x},{y})}}{content}"
+            events.append(f"Dialogue: 0,{start_str},{end_str},Fix,,20,20,2,,{text}")
+        elif mode in (5,):  # 顶部弹幕
+            start_str = _format_ass_time(start_sec)
+            end_str = _format_ass_time(start_sec + fix_duration)
+            y = layout.get_top_y(start_sec, fix_duration)
+            if y is None:  # 轨道满且 skip_overflow=True 时丢弃 (参照 PiliPlus 碰撞检测跳过)
+                continue
+            text = f"{{{color_tag}\\an8\\pos({center_x},{y})}}{content}"
+            events.append(f"Dialogue: 0,{start_str},{end_str},Fix,,20,20,2,,{text}")
+        elif mode == 6:  # 逆向弹幕 (左→右)
+            start_str = _format_ass_time(start_sec)
+            end_str = _format_ass_time(start_sec + scroll_duration)
+            y = layout.get_scroll_y(start_sec, scroll_duration)
+            if y is None:  # 轨道满且 skip_overflow=True 时丢弃 (参照 PiliPlus 碰撞检测跳过)
+                continue
+            text_w = _estimate_text_width(content, font_size)
+            start_x = -text_w
+            end_x = play_res_x + text_w
+            text = f"{{{color_tag}\\move({start_x},{y},{end_x},{y})}}{content}"
+            events.append(f"Dialogue: 0,{start_str},{end_str},R2L,,20,20,2,,{text}")
+        else:  # mode 1,2,3,7,8,9 = 滚动弹幕 (右→左)
+            start_str = _format_ass_time(start_sec)
+            end_str = _format_ass_time(start_sec + scroll_duration)
+            y = layout.get_scroll_y(start_sec, scroll_duration)
+            if y is None:  # 轨道满且 skip_overflow=True 时丢弃 (参照 PiliPlus 碰撞检测跳过)
+                continue
+            text_w = _estimate_text_width(content, font_size)
+            start_x = play_res_x + text_w
+            end_x = -text_w
+            text = f"{{{color_tag}\\move({start_x},{y},{end_x},{y})}}{content}"
+            events.append(f"Dialogue: 0,{start_str},{end_str},R2L,,20,20,2,,{text}")
+
+    return header + '\n'.join(events) + '\n'
+
+
+def _danmaku_list_to_xml(danmaku_list, cid=0):
+    """将弹幕列表转换为标准 B 站 XML 弹幕格式"""
+    if not danmaku_list:
+        return ""
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<i>']
+    for dm in danmaku_list:
+        time_sec = dm['progress'] / 1000.0
+        # 标准格式: p="时间,模式,字号,颜色,时间戳,弹幕池,用户hash,弹幕id"
+        p_attr = f"{time_sec:.3f},{dm['mode']},{dm['fontsize']},{dm['color']},{dm['ctime']},{dm['pool']},{dm['midHash']},{dm['id']}"
+        content = dm['content'].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        lines.append(f'    <d p="{p_attr}">{content}</d>')
+    lines.append('</i>')
+    return '\n'.join(lines)
+
+
+# ============================================================
 # 配置管理
 # ============================================================
 
@@ -128,6 +469,16 @@ def load_config():
         "download_dir": "",
         "user_agent": DEFAULT_UA,
         "default_qn": 80,
+        "download_danmaku": True,
+        "danmaku_format": "ass",
+        "danmaku_font_size": 15,
+        "danmaku_line_height": 1.4,
+        "danmaku_show_area": 0.6,
+        "danmaku_scroll_duration": 12.0,
+        "danmaku_fix_duration": 4.0,
+        "danmaku_merge": True,
+        "danmaku_weight": 0,
+        "danmaku_skip_overflow": True,
         "user_info": None
     }
 
@@ -361,7 +712,7 @@ def fingerprint_to_cookie_str(fp):
 
 class BilibiliClient:
     def __init__(self):
-        self.session = requests.Session()
+        self._thread_local = threading.local()
         self.wbi_signer = WBISigner()
         self.fingerprint = {}
         self.login_cookies = {}
@@ -369,6 +720,13 @@ class BilibiliClient:
         self.user_info = None
         self.config = load_config()
         self._initialized = False
+
+    @property
+    def session(self):
+        """每个线程独立持有 requests.Session，避免多线程并发崩溃"""
+        if not hasattr(self._thread_local, 'session'):
+            self._thread_local.session = requests.Session()
+        return self._thread_local.session
 
     def init_async(self):
         """异步初始化，在后台线程中调用"""
@@ -724,27 +1082,30 @@ class BilibiliClient:
 
     def download_file(self, url, filepath, headers, progress_callback=None, cancel_flag=None):
         resp = self.session.get(url, headers=headers, stream=True, timeout=120)
-        total_size = int(resp.headers.get("content-length", 0))
-        downloaded = 0
-        start_time = time.time()
-        last_update = 0
+        try:
+            total_size = int(resp.headers.get("content-length", 0))
+            downloaded = 0
+            start_time = time.time()
+            last_update = 0
 
-        with open(filepath, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                if cancel_flag and cancel_flag.is_set():
-                    return False
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    current_time = time.time()
-                    if total_size > 0 and (current_time - last_update > 0.2 or downloaded >= total_size):
-                        last_update = current_time
-                        percent = min((downloaded / total_size) * 100, 100)
-                        elapsed = current_time - start_time
-                        speed = downloaded / elapsed if elapsed > 0 else 0
-                        if progress_callback:
-                            progress_callback(percent, downloaded, total_size, speed)
-        return True
+            with open(filepath, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if cancel_flag and cancel_flag.is_set():
+                        return False
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        current_time = time.time()
+                        if total_size > 0 and (current_time - last_update > 0.2 or downloaded >= total_size):
+                            last_update = current_time
+                            percent = min((downloaded / total_size) * 100, 100)
+                            elapsed = current_time - start_time
+                            speed = downloaded / elapsed if elapsed > 0 else 0
+                            if progress_callback:
+                                progress_callback(percent, downloaded, total_size, speed)
+            return True
+        finally:
+            resp.close()
 
     def get_collection_videos(self, bvid):
         """通过BV号获取视频所属合集的所有视频"""
@@ -841,13 +1202,59 @@ class BilibiliClient:
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 startupinfo.wShowWindow = subprocess.SW_HIDE
+            # 不设 timeout: 长视频 (2h+) 的 IO 读写可能耗时较长
+            # stderr/stdout 重定向到 DEVNULL: ffmpeg 进度输出量巨大，缓存到 PIPE 会撑爆内存
             result = subprocess.run(
                 cmd, startupinfo=startupinfo,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=None
             )
             return result.returncode == 0
         except Exception:
             return False
+
+    def get_danmaku(self, cid, bvid="", fmt="ass", max_segments=100):
+        """通过 protobuf seg.so 接口获取弹幕并转为指定格式。
+        对齐 pilipala 的弹幕接口: /x/v2/dm/web/seg.so
+        每段覆盖 6 分钟，按 segment_index 递增请求直到无数据。
+        fmt: "ass" 返回 ASS 字幕 (含滚动/位置/颜色), "xml" 返回 B站标准 XML。
+        """
+        all_danmaku = []
+        referer = f"https://www.bilibili.com/video/{bvid}" if bvid else "https://www.bilibili.com"
+        headers = self._get_headers(referer=referer)
+
+        for seg_idx in range(1, max_segments + 1):
+            url = (
+                f"https://api.bilibili.com/x/v2/dm/web/seg.so"
+                f"?type=1&oid={cid}&segment_index={seg_idx}"
+            )
+            try:
+                resp = self.session.get(url, headers=headers, timeout=15)
+                if resp.status_code != 200 or not resp.content:
+                    break
+                seg_danmaku = _parse_danmaku_seg(resp.content)
+                if not seg_danmaku:
+                    break
+                all_danmaku.extend(seg_danmaku)
+            except Exception:
+                break
+
+        if not all_danmaku:
+            return ""
+
+        if fmt == "xml":
+            # XML 保持原始弹幕数据，不做合并/过滤 (仅 ASS 输出应用 PiliPlus 防遮挡处理)
+            return _danmaku_list_to_xml(all_danmaku, cid)
+        return _danmaku_list_to_ass(
+            all_danmaku,
+            font_size=self.config.get("danmaku_font_size", 15),
+            scroll_duration=self.config.get("danmaku_scroll_duration", 12.0),
+            fix_duration=self.config.get("danmaku_fix_duration", 4.0),
+            line_height=self.config.get("danmaku_line_height", 1.4),
+            show_area=self.config.get("danmaku_show_area", 0.6),
+            merge=self.config.get("danmaku_merge", True),
+            weight_filter=self.config.get("danmaku_weight", 0),
+            skip_overflow=self.config.get("danmaku_skip_overflow", True),
+        )
 
 
 # ============================================================
@@ -1224,6 +1631,7 @@ class DownloadQueueManager(QObject):
         self.queue = []
         self.active_tasks = {}
         self.task_workers = {}
+        self._finishing_workers = []   # 等待线程真正结束后清理的 worker 引用
         self._lock = threading.Lock()
         self._task_counter = 0
 
@@ -1252,16 +1660,20 @@ class DownloadQueueManager(QObject):
 
     def _try_start_next(self):
         task = None
+        should_emit_all_finished = False
         with self._lock:
             if len(self.active_tasks) >= self.max_concurrent:
                 return
             if not self.queue:
                 if not self.active_tasks:
-                    self.all_finished.emit()
+                    should_emit_all_finished = True
                 return
             
             task = self.queue.pop(0)
             self.active_tasks[task["id"]] = task
+        
+        if should_emit_all_finished:
+            self.all_finished.emit()
         
         if task:
             task_id = task["id"]
@@ -1279,20 +1691,31 @@ class DownloadQueueManager(QObject):
             worker.finished_signal.connect(
                 lambda success, msg, tid=task_id: self._on_task_finished(tid, success, msg)
             )
+            # 连接 QThread 内置 finished 信号，在线程真正结束后才清理引用
+            worker.finished.connect(
+                lambda tid=task_id: self._on_worker_thread_finished(tid)
+            )
             
             self.task_workers[task_id] = worker
             self.task_started.emit(task_id)
             worker.start()
 
     def _on_task_finished(self, task_id, success, msg):
+        # 注意: 此时 QThread.run() 刚返回但线程尚未真正结束，
+        # 不能在此删除 worker 引用，否则 Python GC 会回收正在结束的 QThread 导致崩溃。
         with self._lock:
             if task_id in self.active_tasks:
                 del self.active_tasks[task_id]
-            if task_id in self.task_workers:
-                del self.task_workers[task_id]
         
         self.task_finished.emit(task_id, success, msg)
         self._try_start_next()
+
+    def _on_worker_thread_finished(self, task_id):
+        """QThread 内置 finished 信号回调: 线程已真正结束，安全清理 worker 引用"""
+        worker = self.task_workers.pop(task_id, None)
+        if worker is not None:
+            self._finishing_workers.append(worker)
+            worker.deleteLater()
 
     def cancel_task(self, task_id):
         if task_id in self.task_workers:
@@ -1326,6 +1749,9 @@ class DownloadWorker(QThread):
         self.cancel_flag = threading.Event()
 
     def run(self):
+        video_temp = None
+        audio_temp = None
+        _signal_sent = False
         try:
             self.status_signal.emit("正在获取下载链接...")
             
@@ -1335,11 +1761,13 @@ class DownloadWorker(QThread):
                 pages = self.client.get_video_pages(self.bvid)
                 if not pages:
                     self.finished_signal.emit(False, "获取视频分P信息失败")
+                    _signal_sent = True
                     return
                 page_idx = self.page_index if self.page_index < len(pages) else 0
                 self.cid = pages[page_idx].get("cid")
                 if not self.cid:
                     self.finished_signal.emit(False, "无法获取视频CID")
+                    _signal_sent = True
                     return
                 self.log_signal.emit(f"获取到CID: {self.cid}", "INFO")
 
@@ -1348,11 +1776,13 @@ class DownloadWorker(QThread):
             play_data = self.client.get_play_url(self.bvid, self.cid, self.qn)
             if not play_data:
                 self.finished_signal.emit(False, "获取播放链接失败")
+                _signal_sent = True
                 return
 
             dash = play_data.get("dash", {})
             if not dash:
                 self.finished_signal.emit(False, "未获取到DASH数据，可能需要登录")
+                _signal_sent = True
                 return
 
             video_stream = self.client.select_video_stream(dash, self.qn)
@@ -1360,6 +1790,7 @@ class DownloadWorker(QThread):
 
             if not video_stream:
                 self.finished_signal.emit(False, "未找到合适的视频流")
+                _signal_sent = True
                 return
 
             video_url = video_stream.get("baseUrl") or video_stream.get("base_url", "")
@@ -1369,6 +1800,7 @@ class DownloadWorker(QThread):
 
             if not video_url:
                 self.finished_signal.emit(False, "视频流URL为空")
+                _signal_sent = True
                 return
 
             download_dir = get_download_dir()
@@ -1378,9 +1810,16 @@ class DownloadWorker(QThread):
             else:
                 base_name = safe_title
 
-            video_temp = os.path.join(download_dir, f"{base_name}_video.m4s")
-            audio_temp = os.path.join(download_dir, f"{base_name}_audio.m4s")
-            output_file = os.path.join(download_dir, f"{base_name}.mp4")
+            # 创建视频专属子文件夹: 视频名文件夹/视频.mp4 + 弹幕文件
+            video_folder = os.path.join(download_dir, base_name)
+            os.makedirs(video_folder, exist_ok=True)
+
+            video_temp = os.path.join(video_folder, f"{base_name}_video.m4s")
+            audio_temp = os.path.join(video_folder, f"{base_name}_audio.m4s")
+            output_file = os.path.join(video_folder, f"{base_name}.mp4")
+            dm_format = self.client.config.get("danmaku_format", "ass")
+            dm_ext = "xml" if dm_format == "xml" else "ass"
+            danmaku_file = os.path.join(video_folder, f"{base_name}.{dm_ext}")
 
             dl_headers = self.client._get_headers(referer=f"https://www.bilibili.com/video/{self.bvid}")
             dl_headers["Range"] = "bytes=0-"
@@ -1394,8 +1833,8 @@ class DownloadWorker(QThread):
 
             ok = self.client.download_file(video_url, video_temp, dl_headers, video_progress, self.cancel_flag)
             if not ok:
-                self._cleanup(video_temp, audio_temp)
                 self.finished_signal.emit(False, "视频流下载已取消或失败")
+                _signal_sent = True
                 return
 
             if audio_url:
@@ -1408,33 +1847,74 @@ class DownloadWorker(QThread):
 
                 ok = self.client.download_file(audio_url, audio_temp, dl_headers, audio_progress, self.cancel_flag)
                 if not ok:
-                    self._cleanup(video_temp, audio_temp)
                     self.finished_signal.emit(False, "音频流下载已取消或失败")
+                    _signal_sent = True
                     return
 
                 self.status_signal.emit("正在合并音视频...")
                 self.log_signal.emit("正在使用ffmpeg合并音视频...", "INFO")
 
                 merge_ok = self.client.merge_video_audio(video_temp, audio_temp, output_file)
-                self._cleanup(video_temp, audio_temp)
 
                 if not merge_ok:
                     self.finished_signal.emit(False, "ffmpeg合并失败，请确保已安装ffmpeg")
+                    _signal_sent = True
                     return
             else:
                 import shutil
                 shutil.move(video_temp, output_file)
-                self._cleanup(audio_temp)
+                video_temp = None  # 已移动，无需再清理
+
+            # 下载完成后清理临时文件
+            self._cleanup(video_temp, audio_temp)
+            audio_temp = None
+            video_temp = None
 
             file_size = os.path.getsize(output_file) if os.path.exists(output_file) else 0
+
+            # 下载弹幕文件 (对齐 pilipala 的 seg.so 接口)
+            danmaku_ok = False
+            if self.client.config.get("download_danmaku", True):
+                self.status_signal.emit("正在下载弹幕...")
+                self.log_signal.emit(f"正在获取弹幕文件 ({dm_format.upper()}格式)...", "INFO")
+                try:
+                    if self.cancel_flag.is_set():
+                        self.finished_signal.emit(False, "下载已取消")
+                        _signal_sent = True
+                        return
+                    danmaku_content = self.client.get_danmaku(self.cid, self.bvid, fmt=dm_format)
+                    if danmaku_content:
+                        with open(danmaku_file, "w", encoding="utf-8") as f:
+                            f.write(danmaku_content)
+                        danmaku_ok = True
+                        self.log_signal.emit(f"弹幕已保存: {danmaku_file}", "INFO")
+                    else:
+                        self.log_signal.emit("该视频无弹幕或获取失败，已跳过", "WARNING")
+                except Exception as e:
+                    self.log_signal.emit(f"弹幕下载失败: {e}", "WARNING")
+
             self.progress_signal.emit(100, 1, 1, 0)
             self.status_signal.emit("下载完成!")
             self.log_signal.emit(f"下载完成: {output_file} ({file_size / 1024 / 1024:.2f}MB)", "INFO")
+            if danmaku_ok:
+                self.log_signal.emit(f"弹幕文件: {danmaku_file}", "INFO")
             self.finished_signal.emit(True, output_file)
+            _signal_sent = True
 
         except Exception as e:
             self.log_signal.emit(f"下载异常: {traceback.format_exc()}", "ERROR")
             self.finished_signal.emit(False, str(e))
+            _signal_sent = True
+        except BaseException:
+            self.finished_signal.emit(False, "下载被中断")
+            _signal_sent = True
+            raise
+        finally:
+            # 确保临时文件被清理
+            self._cleanup(video_temp, audio_temp)
+            # 兜底: 确保无论如何 finished_signal 都会发射，避免任务卡死
+            if not _signal_sent:
+                self.finished_signal.emit(False, "下载异常终止")
 
     def _cleanup(self, *files):
         for f in files:
@@ -2970,6 +3450,25 @@ class SettingsDialog(QDialog):
         concurrent_layout.addWidget(self.concurrent_combo, 1)
         layout.addLayout(concurrent_layout)
 
+        # Danmaku download toggle
+        self.danmaku_checkbox = QCheckBox("下载视频时同时下载弹幕文件")
+        self.danmaku_checkbox.setChecked(self.client.config.get("download_danmaku", True))
+        layout.addWidget(self.danmaku_checkbox)
+
+        # Danmaku format selector
+        dm_fmt_layout = QHBoxLayout()
+        dm_fmt_layout.addWidget(QLabel("弹幕格式:"))
+        self.dm_format_combo = QComboBox()
+        self.dm_format_combo.addItem("ASS 字幕 (含滚动/位置/颜色)", "ass")
+        self.dm_format_combo.addItem("XML (B站标准格式)", "xml")
+        current_fmt = self.client.config.get("danmaku_format", "ass")
+        for i in range(self.dm_format_combo.count()):
+            if self.dm_format_combo.itemData(i) == current_fmt:
+                self.dm_format_combo.setCurrentIndex(i)
+                break
+        dm_fmt_layout.addWidget(self.dm_format_combo, 1)
+        layout.addLayout(dm_fmt_layout)
+
         # Separator
         sep1 = QFrame()
         sep1.setFrameShape(QFrame.HLine)
@@ -3079,6 +3578,8 @@ class SettingsDialog(QDialog):
         self.client.config["download_dir"] = self.dir_input.text().strip()
         self.client.config["default_qn"] = self.qn_combo.currentData()
         self.client.config["max_concurrent"] = self.concurrent_combo.currentData()
+        self.client.config["download_danmaku"] = self.danmaku_checkbox.isChecked()
+        self.client.config["danmaku_format"] = self.dm_format_combo.currentData()
         save_config(self.client.config)
 
         download_dir = self.dir_input.text().strip()
@@ -3315,6 +3816,7 @@ class AboutDialog(QDialog):
             "<li>支持多种画质选择</li>"
             "<li>支持二维码扫码登录</li>"
             "<li>DASH格式音视频分离下载+ffmpeg合并</li>"
+            "<li>自动下载弹幕文件（支持ASS/XML格式，对齐pilipala接口）</li>"
             "<li>WBI签名验证</li>"
             "</ul>"
             "<p><b>依赖:</b></p>"
